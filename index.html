@@ -521,6 +521,112 @@ function makeFootprintBuilding(points2D, height, type, holes = []) {
   cityGroup.add(mesh);
   loadedMeshes.push(mesh);
 
+  // Чёрная обводка рёбер — порог угла 20° отсекает внутренние швы триангуляции
+  // плоской крыши (там угол между соседними треугольниками ~0°) и оставляет
+  // только настоящие рёбра геометрии (углы здания, стык стена/крыша).
+  const edges = new THREE.EdgesGeometry(geo, 20);
+  const outline = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0x1a1410 }));
+  cityGroup.add(outline);
+  loadedMeshes.push(outline);
+
+  return mesh;
+}
+
+// ---------------------------------------------------------------------------
+// ВОДОЁМЫ: плоская заливка + чёрная обводка контура. Тот же трюк с shape/
+// rotateX(-90°), что и у зданий (без экструзии — просто плоский полигон,
+// поднятый чуть выше земли, чтобы не z-fighting'ить с текстурой газона).
+// ---------------------------------------------------------------------------
+const WATER_Y = 0.09;
+const waterBodyRegistry = []; // {pts, area} — крупные водоёмы, по ним ходит катер
+const LARGE_WATER_AREA_M2 = 1500; // порог "крупный водоём" для катера
+
+function shoelaceArea(pts) {
+  let sum = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i], b = pts[(i + 1) % pts.length];
+    sum += a.x * b.z - b.x * a.z;
+  }
+  return sum / 2;
+}
+
+function makeWaterBody(points2D, holes = []) {
+  const pts = points2D.slice();
+  if (pts.length > 1) {
+    const a = pts[0], b = pts[pts.length - 1];
+    if (Math.abs(a.x - b.x) < 1e-6 && Math.abs(a.z - b.z) < 1e-6) pts.pop();
+  }
+  if (pts.length < 3) return null;
+
+  const shape = new THREE.Shape(pts.map(p => new THREE.Vector2(p.x, -p.z)));
+  holes.forEach(holePts => {
+    const hp = holePts.slice();
+    if (hp.length > 1) {
+      const a = hp[0], b = hp[hp.length - 1];
+      if (Math.abs(a.x - b.x) < 1e-6 && Math.abs(a.z - b.z) < 1e-6) hp.pop();
+    }
+    if (hp.length >= 3) shape.holes.push(new THREE.Path(hp.map(p => new THREE.Vector2(p.x, -p.z))));
+  });
+
+  const geo = new THREE.ShapeGeometry(shape);
+  geo.rotateX(-Math.PI / 2);
+
+  const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: 0x2f6ea8, side: THREE.DoubleSide }));
+  mesh.position.y = WATER_Y;
+  cityGroup.add(mesh);
+  loadedMeshes.push(mesh);
+
+  // порог 1° — оставляет только настоящую береговую линию, без внутренних
+  // швов триангуляции (там угол между соседними треугольниками ровно 0°)
+  const edges = new THREE.EdgesGeometry(geo, 1);
+  const outline = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0x0d2b3d }));
+  outline.position.y = WATER_Y + 0.005;
+  cityGroup.add(outline);
+  loadedMeshes.push(outline);
+
+  const area = Math.abs(shoelaceArea(pts));
+  if (area > LARGE_WATER_AREA_M2) waterBodyRegistry.push({ pts, area });
+
+  return mesh;
+}
+
+// ---------------------------------------------------------------------------
+// ЗАБОРЫ/ОГРАЖДЕНИЯ (barrier=fence/wall/hedge/...): тонкая вертикальная
+// лента вдоль полилинии — тот же принцип, что и у дорог, только без ширины,
+// просто плоскость от земли до нужной высоты.
+// ---------------------------------------------------------------------------
+const BARRIER_STYLE = {
+  fence:          { color: 0x8a6a45, height: 1.2 },
+  wall:           { color: 0x9a9a92, height: 1.6 },
+  retaining_wall: { color: 0x7a7a72, height: 1.0 },
+  hedge:          { color: 0x3a5a30, height: 1.4 },
+  gate:           { color: 0x6a6a62, height: 1.2 },
+};
+const DEFAULT_BARRIER_STYLE = { color: 0x8a6a45, height: 1.2 };
+
+function makeBarrier(points2D, tags) {
+  if (points2D.length < 2) return null;
+  const style = BARRIER_STYLE[tags.barrier] || DEFAULT_BARRIER_STYLE;
+
+  const positions = [];
+  const indices = [];
+  for (let i = 0; i < points2D.length; i++) {
+    const p = points2D[i];
+    positions.push(p.x, 0, p.z);
+    positions.push(p.x, style.height, p.z);
+  }
+  for (let i = 0; i < points2D.length - 1; i++) {
+    const a = i * 2, b = i * 2 + 1, c = i * 2 + 2, d = i * 2 + 3;
+    indices.push(a, b, c, b, d, c);
+  }
+
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setIndex(indices);
+
+  const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: style.color, side: THREE.DoubleSide }));
+  cityGroup.add(mesh);
+  loadedMeshes.push(mesh);
   return mesh;
 }
 
@@ -533,6 +639,7 @@ function clearLoadedBuildings() {
   });
   loadedMeshes.length = 0;
   roadRegistry.length = 0;
+  waterBodyRegistry.length = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -629,13 +736,13 @@ function carBodyColor() {
   return palette[Math.floor(Math.random() * palette.length)];
 }
 
+// Длинная сторона всех моделей транспорта — вдоль локальной оси Z. Это важно:
+// pointAtDistance() отдаёт heading = atan2(dx, dz), а при rotation.y=0
+// three.js направляет локальную +Z вперёд в мировых координатах — значит
+// "перёд" машины должен смотреть вдоль Z, иначе при повороте на heading
+// транспорт едет боком.
 function makeCarMesh() {
   const group = new THREE.Group();
-  // Длинная сторона кузова/кабины — вдоль локальной оси Z. Это важно:
-  // pointAtDistance() отдаёт heading = atan2(dx, dz), а при rotation.y=0
-  // three.js направляет локальную +Z вперёд в мировых координатах — значит
-  // "перёд" машины должен смотреть вдоль Z, иначе при повороте на heading
-  // машина едет боком (что и было при length вдоль X).
   const body = new THREE.Mesh(
     new THREE.BoxGeometry(1.9, 1.4, 4.2),
     new THREE.MeshBasicMaterial({ color: carBodyColor() })
@@ -650,6 +757,62 @@ function makeCarMesh() {
   return group;
 }
 
+function makeBusMesh() {
+  const group = new THREE.Group();
+  const livery = Math.random() < 0.5 ? 0x2a5fd9 : 0x2a9d5a; // синий / зелёный
+  const body = new THREE.Mesh(
+    new THREE.BoxGeometry(2.4, 2.6, 7.2),
+    new THREE.MeshBasicMaterial({ color: livery })
+  );
+  body.position.y = 1.5;
+  const windowStrip = new THREE.Mesh(
+    new THREE.BoxGeometry(2.42, 0.7, 7.0),
+    new THREE.MeshBasicMaterial({ color: 0xbfe6f2 })
+  );
+  windowStrip.position.y = 2.1;
+  group.add(body, windowStrip);
+  return group;
+}
+
+function makeTruckMesh() {
+  const group = new THREE.Group();
+  const cab = new THREE.Mesh(
+    new THREE.BoxGeometry(2.2, 2.0, 2.0),
+    new THREE.MeshBasicMaterial({ color: 0xd8d8d0 })
+  );
+  cab.position.set(0, 1.2, -3.0);
+  const cargoColors = [0xb08050, 0x5a7a5a, 0x8a8a8a, 0xc9a227];
+  const cargo = new THREE.Mesh(
+    new THREE.BoxGeometry(2.3, 2.4, 5.0),
+    new THREE.MeshBasicMaterial({ color: cargoColors[Math.floor(Math.random() * cargoColors.length)] })
+  );
+  cargo.position.set(0, 1.4, 0.7);
+  group.add(cab, cargo);
+  return group;
+}
+
+// Микс типов транспорта: на магистралях (primary и крупнее) заметная доля
+// автобусов/грузовиков, во дворах и на service — почти только легковые.
+const VEHICLE_MIX_MAJOR = { car: 0.65, bus: 0.15, truck: 0.20 };
+const VEHICLE_MIX_LOCAL = { car: 0.95, bus: 0,    truck: 0.05 };
+const MAJOR_HIGHWAYS = new Set(['motorway', 'trunk', 'primary', 'secondary', 'tertiary']);
+const VEHICLE_SPEED_MUL = { car: 1, bus: 0.85, truck: 0.8 };
+
+function vehicleMixFor(highway) {
+  return MAJOR_HIGHWAYS.has(highway) ? VEHICLE_MIX_MAJOR : VEHICLE_MIX_LOCAL;
+}
+function pickVehicleKind(mix) {
+  const r = Math.random();
+  if (r < mix.car) return 'car';
+  if (r < mix.car + mix.bus) return 'bus';
+  return 'truck';
+}
+function makeVehicleMesh(kind) {
+  if (kind === 'bus') return makeBusMesh();
+  if (kind === 'truck') return makeTruckMesh();
+  return makeCarMesh();
+}
+
 function spawnCars() {
   cars.forEach(c => cityGroup.remove(c.mesh));
   cars = [];
@@ -662,13 +825,15 @@ function spawnCars() {
     // service — не на каждом дворовом проезде должна стоять машина
     if (road.highway === 'service' && count > 0 && Math.random() > 0.35) count = 0;
 
+    const mix = vehicleMixFor(road.highway);
     for (let i = 0; i < count; i++) {
-      const mesh = makeCarMesh();
+      const kind = pickVehicleKind(mix);
+      const mesh = makeVehicleMesh(kind);
       cityGroup.add(mesh);
       cars.push({
         mesh, road,
         dist: Math.random() * road.total,
-        speed: profile.speedMin + Math.random() * (profile.speedMax - profile.speedMin),
+        speed: (profile.speedMin + Math.random() * (profile.speedMax - profile.speedMin)) * VEHICLE_SPEED_MUL[kind],
         dir: Math.random() < 0.5 ? 1 : -1,
       });
     }
@@ -702,6 +867,64 @@ function updateCars(dt) {
 }
 
 // ---------------------------------------------------------------------------
+// МОТОРНАЯ ЛОДКА: по каждому крупному водоёму (waterBodyRegistry) ходит одна
+// лодка по круговой траектории вокруг центроида полигона — простая, но
+// достаточная имитация патрулирования акватории без честного pathfinding.
+// ---------------------------------------------------------------------------
+let boats = [];
+
+function makeBoatMesh() {
+  const group = new THREE.Group();
+  const hull = new THREE.Mesh(
+    new THREE.BoxGeometry(1.6, 0.6, 4.2),
+    new THREE.MeshBasicMaterial({ color: 0xe8e4d8 })
+  );
+  hull.position.y = 0.35;
+  const cabin = new THREE.Mesh(
+    new THREE.BoxGeometry(1.2, 0.7, 1.6),
+    new THREE.MeshBasicMaterial({ color: 0x3a5a78 })
+  );
+  cabin.position.set(0, 0.9, -0.6);
+  group.add(hull, cabin);
+  return group;
+}
+
+function spawnBoats() {
+  boats.forEach(b => cityGroup.remove(b.mesh));
+  boats = [];
+
+  waterBodyRegistry.forEach(body => {
+    const cx = body.pts.reduce((s, p) => s + p.x, 0) / body.pts.length;
+    const cz = body.pts.reduce((s, p) => s + p.z, 0) / body.pts.length;
+    const avgR = body.pts.reduce((s, p) => s + Math.hypot(p.x - cx, p.z - cz), 0) / body.pts.length;
+
+    const mesh = makeBoatMesh();
+    cityGroup.add(mesh);
+    boats.push({
+      mesh, cx, cz,
+      radius: avgR * 0.55, // держимся подальше от берега
+      angle: Math.random() * Math.PI * 2,
+      angularSpeed: (0.12 + Math.random() * 0.08) * (Math.random() < 0.5 ? 1 : -1),
+    });
+  });
+}
+
+function updateBoats(dt) {
+  boats.forEach(b => {
+    b.angle += b.angularSpeed * dt;
+    const x = b.cx + Math.cos(b.angle) * b.radius;
+    const z = b.cz + Math.sin(b.angle) * b.radius;
+    b.mesh.position.set(x, 0.15, z);
+
+    // курс — касательная к окружности в направлении движения
+    const dirSign = b.angularSpeed >= 0 ? 1 : -1;
+    const dx = -Math.sin(b.angle) * dirSign;
+    const dz = Math.cos(b.angle) * dirSign;
+    b.mesh.rotation.y = Math.atan2(dx, dz);
+  });
+}
+
+// ---------------------------------------------------------------------------
 // OVERPASS: запрос зданий внутри bbox.
 // Порядок зеркал: сначала VK Maps (RU) — по опыту стабильнее из РФ, чем
 // немецкий overpass-api.de; дальше официальный основной сервер; дальше
@@ -716,7 +939,15 @@ const OVERPASS_ENDPOINTS = [
 const OVERPASS_TIMEOUT_MS = 12000; // не ждём зависшее зеркало вечно — переходим к следующему
 
 async function fetchCityData(latMin, lonMin, latMax, lonMax, onAttempt) {
-  const query = `[out:json][timeout:25];(way["building"](${latMin},${lonMin},${latMax},${lonMax});relation["building"](${latMin},${lonMin},${latMax},${lonMax});way["highway"](${latMin},${lonMin},${latMax},${lonMax}););out geom;`;
+  const query = `[out:json][timeout:25];(
+    way["building"](${latMin},${lonMin},${latMax},${lonMax});
+    relation["building"](${latMin},${lonMin},${latMax},${lonMax});
+    way["highway"](${latMin},${lonMin},${latMax},${lonMax});
+    way["natural"="water"](${latMin},${lonMin},${latMax},${lonMax});
+    relation["natural"="water"](${latMin},${lonMin},${latMax},${lonMax});
+    way["landuse"="reservoir"](${latMin},${lonMin},${latMax},${lonMax});
+    way["barrier"](${latMin},${lonMin},${latMax},${lonMax});
+  );out geom;`;
 
   let lastErr;
   for (const endpoint of OVERPASS_ENDPOINTS) {
@@ -815,15 +1046,25 @@ function updateMinimapOverlay(elements) {
         L.polygon(latlngs, { color, weight: 1, fillColor: color, fillOpacity: 0.65 }).addTo(minimapBuildingsLayer);
       } else if (el.tags?.highway) {
         L.polyline(latlngs, { color: '#5cf', weight: 2, opacity: 0.8 }).addTo(minimapRoadsLayer);
+      } else if (el.tags?.natural === 'water' || el.tags?.landuse === 'reservoir') {
+        L.polygon(latlngs, { color: '#1f4f70', weight: 1, fillColor: '#2f6ea8', fillOpacity: 0.7 }).addTo(minimapBuildingsLayer);
+      } else if (el.tags?.barrier) {
+        L.polyline(latlngs, { color: '#a08050', weight: 1, opacity: 0.8, dashArray: '3,3' }).addTo(minimapRoadsLayer);
       }
-    } else if (el.type === 'relation' && el.tags?.building) {
+    } else if (el.type === 'relation' && (el.tags?.building || el.tags?.natural === 'water')) {
+      const isWater = el.tags?.natural === 'water';
       const outerSegs = [], innerSegs = [];
       (el.members || []).forEach(m => {
         if (!m.geometry) return;
         (m.role === 'inner' ? innerSegs : outerSegs).push(m.geometry);
       });
-      const type = classifyBuilding(el.tags);
-      const color = type === 'residential' ? '#d98a4a' : type === 'industrial' ? '#8a97a3' : '#b8b0a0';
+      let color;
+      if (isWater) {
+        color = '#2f6ea8';
+      } else {
+        const type = classifyBuilding(el.tags);
+        color = type === 'residential' ? '#d98a4a' : type === 'industrial' ? '#8a97a3' : '#b8b0a0';
+      }
       assembleRings(outerSegs).forEach(ring => {
         const latlngs = ring.map(pt => [pt.lat, pt.lon]);
         const holeLatlngs = assembleRings(innerSegs).map(h => h.map(pt => [pt.lat, pt.lon]));
@@ -866,7 +1107,7 @@ async function loadFromOverpass() {
     );
     clearLoadedBuildings();
 
-    let buildingCount = 0, roadCount = 0;
+    let buildingCount = 0, roadCount = 0, waterCount = 0, barrierCount = 0;
     for (const el of elements) {
       if (el.type === 'way' && el.geometry) {
         const points2D = el.geometry.map(g => geoToLocal(g.lat, g.lon, refLat, refLon));
@@ -876,6 +1117,10 @@ async function loadFromOverpass() {
           if (makeFootprintBuilding(points2D, height, type)) buildingCount++;
         } else if (el.tags?.highway) {
           if (makeRoad(points2D, el.tags)) roadCount++;
+        } else if (el.tags?.natural === 'water' || el.tags?.landuse === 'reservoir') {
+          if (makeWaterBody(points2D)) waterCount++;
+        } else if (el.tags?.barrier) {
+          if (makeBarrier(points2D, el.tags)) barrierCount++;
         }
       } else if (el.type === 'relation' && el.tags?.building) {
         // multipolygon: контур (и дырки-дворы) собраны из нескольких way-фрагментов —
@@ -901,16 +1146,35 @@ async function loadFromOverpass() {
           );
           if (makeFootprintBuilding(outerPts, height, type, holes)) buildingCount++;
         });
+      } else if (el.type === 'relation' && el.tags?.natural === 'water') {
+        // multipolygon-водоём (озеро с островом внутри и т.п.) — та же сборка колец
+        const outerSegs = [], innerSegs = [];
+        (el.members || []).forEach(m => {
+          if (!m.geometry || m.geometry.length < 2) return;
+          (m.role === 'inner' ? innerSegs : outerSegs).push(m.geometry);
+        });
+        const outerRings = assembleRings(outerSegs)
+          .map(ring => ring.map(pt => geoToLocal(pt.lat, pt.lon, refLat, refLon)));
+        const innerRings = assembleRings(innerSegs)
+          .map(ring => ring.map(pt => geoToLocal(pt.lat, pt.lon, refLat, refLon)));
+
+        outerRings.forEach(outerPts => {
+          const holes = innerRings.filter(ring =>
+            ring.length && (outerRings.length === 1 || pointInPolygon(ring[0], outerPts))
+          );
+          if (makeWaterBody(outerPts, holes)) waterCount++;
+        });
       }
     }
     spawnCars();
+    spawnBoats();
 
     const corner1 = geoToLocal(latMin, lonMin, refLat, refLon);
     const corner2 = geoToLocal(latMax, lonMax, refLat, refLon);
     reframeTo(Math.abs(corner2.x - corner1.x), Math.abs(corner2.z - corner1.z));
     updateMinimapOverlay(elements);
 
-    statusEl.textContent = `готово: ${buildingCount} зданий, ${roadCount} дорог, ${cars.length} машин (${new URL(endpoint).hostname})`;
+    statusEl.textContent = `готово: ${buildingCount} зданий, ${roadCount} дорог, ${waterCount} водоёмов, ${barrierCount} заборов, ${cars.length} машин, ${boats.length} лодок (${new URL(endpoint).hostname})`;
   } catch (e) {
     statusEl.textContent = 'ошибка Overpass — демо-заглушка';
     console.error(e);
@@ -988,6 +1252,7 @@ function animate() {
   requestAnimationFrame(animate);
   const dt = Math.min(clock.getDelta(), 0.1); // clamp, чтобы вкладка после сворачивания не дёрнула машины телепортом
   updateCars(dt);
+  updateBoats(dt);
   renderer.render(scene, camera);
 }
 animate();
