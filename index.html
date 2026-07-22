@@ -1,0 +1,651 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<title>Isometric City — визуальный skeleton</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  html, body {
+    margin: 0; padding: 0; overflow: hidden;
+    background: #1a1a1e;
+    font-family: 'Courier New', monospace;
+  }
+  #canvas-wrap {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+  }
+  canvas {
+    image-rendering: pixelated;
+    image-rendering: crisp-edges;
+    border: 2px solid #333;
+  }
+  #hud {
+    position: absolute; top: 12px; left: 12px;
+    color: #9fd; font-size: 12px; line-height: 1.5;
+    background: rgba(0,0,0,0.5); padding: 8px 12px;
+    border: 1px solid #2a2;
+    pointer-events: none;
+  }
+  #compass {
+    position: absolute; top: 78px; left: 12px;
+    width: 44px; height: 44px;
+    pointer-events: none;
+  }
+  #minimap {
+    position: absolute; top: 12px; right: 12px;
+    width: 220px; height: 220px;
+    border: 2px solid #333;
+    filter: saturate(0.9) brightness(0.95);
+  }
+  #minimap-label {
+    position: absolute; top: 236px; right: 12px;
+    width: 220px; text-align: center;
+    color: #9fd; font-size: 10px;
+    background: rgba(0,0,0,0.5); padding: 3px 0;
+    pointer-events: none;
+  }
+  #controls {
+    position: absolute; bottom: 12px; left: 12px;
+    color: #ccc; font-size: 12px;
+    background: rgba(0,0,0,0.5); padding: 8px 12px;
+    border: 1px solid #444;
+  }
+  button {
+    font-family: 'Courier New', monospace;
+    background: #222; color: #9fd; border: 1px solid #2a2;
+    padding: 4px 10px; margin-right: 6px; cursor: pointer;
+  }
+  button:hover { background: #2a2a2a; }
+  #data-panel {
+    position: absolute; bottom: 12px; right: 12px;
+    color: #ccc; font-size: 12px;
+    background: rgba(0,0,0,0.6); padding: 10px 12px;
+    border: 1px solid #444; width: 230px;
+  }
+  #data-panel input {
+    width: 70px; background: #111; color: #9fd; border: 1px solid #333;
+    font-family: 'Courier New', monospace; font-size: 11px; padding: 2px 4px; margin-bottom: 4px;
+  }
+  #data-panel .row { display: flex; justify-content: space-between; margin-bottom: 4px; }
+  #status { color: #f5c; margin-top: 6px; min-height: 14px; }
+</style>
+</head>
+<body>
+
+<div id="canvas-wrap"></div>
+
+<div id="hud">
+  ISO SKELETON // real Overpass footprints, fixed isometric camera<br>
+  зелёная сетка — 1 клетка = <span id="hud-cell">10</span> м (авто-подгонка под bbox)
+</div>
+
+<div id="controls">
+  render scale:
+  <button data-scale="0.25">chunky (¼)</button>
+  <button data-scale="0.5">medium (½)</button>
+  <button data-scale="1">sharp (1×)</button>
+</div>
+
+<div id="data-panel">
+  <div class="row"><span>lat min</span><input id="latMin" value="53.2505"></div>
+  <div class="row"><span>lat max</span><input id="latMax" value="53.2535"></div>
+  <div class="row"><span>lon min</span><input id="lonMin" value="34.3680"></div>
+  <div class="row"><span>lon max</span><input id="lonMax" value="34.3730"></div>
+  <button id="loadBtn">load buildings (Overpass)</button>
+  <div id="status">idle</div>
+</div>
+
+<svg id="compass" viewBox="0 0 60 60">
+  <circle cx="30" cy="30" r="26" fill="rgba(0,0,0,0.6)" stroke="#2a2" stroke-width="1.5"/>
+  <g id="compass-needle">
+    <line x1="30" y1="30" x2="30" y2="10" stroke="#f55" stroke-width="2"/>
+    <text x="30" y="8" fill="#f55" font-size="10" text-anchor="middle" font-family="Courier New">N</text>
+  </g>
+</svg>
+
+<div id="minimap"></div>
+<div id="minimap-label">миникарта (реальность, OSM)</div>
+
+<script src="https://cdn.jsdelivr.net/npm/leaflet@1.9.4/dist/leaflet.js"></script>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+// ---------------------------------------------------------------------------
+// НАСТРОЙКИ ПРОЕКЦИИ
+// ---------------------------------------------------------------------------
+// Мировые оси (до поворота "city group"):
+//   +X = восток, -Z = север, +Y = вверх.
+// Вся "городская" геометрия кладётся в CITY_GROUP, который разворачиваем на
+// 45° вокруг Y — это даёт классическую ромбовидную изометрию на экране.
+// Камера стоит строго по диагонали (1,1,1) — угол места 35.264° (true isometric).
+const CITY_ROTATION_DEG = 45;           // поворот сетки для ромбовидного вида
+const CELL_SIZE = 10;                    // метры на одну ячейку грида
+const GRID_CELLS = 20;                   // 20×20 ячеек = квартал ~200×200 м
+
+let INTERNAL_SCALE = 0.5;                // множитель разрешения рендера (пиксель-арт чанкость)
+
+// ---------------------------------------------------------------------------
+// БАЗА: сцена, камера, свет
+// ---------------------------------------------------------------------------
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1a1a1e);
+
+const wrap = document.getElementById('canvas-wrap');
+const VIEW_W = Math.min(window.innerWidth - 20, 960);
+const VIEW_H = Math.min(window.innerHeight - 20, 640);
+
+const renderer = new THREE.WebGLRenderer({ antialias: false });
+renderer.setPixelRatio(1); // важно: сами контролируем пиксельность через internal scale
+wrap.appendChild(renderer.domElement);
+
+// Ортографическая камера — фиксированный изометрический вид
+const FRUSTUM_SIZE_STATE = { value: 140 }; // "зум" в метрах видимой области, меняется под bbox
+let camera;
+function buildCamera() {
+  const aspect = VIEW_W / VIEW_H;
+  const f = FRUSTUM_SIZE_STATE.value;
+  camera = new THREE.OrthographicCamera(
+    -f * aspect / 2, f * aspect / 2,
+    f / 2, -f / 2,
+    0.1, 1000
+  );
+  const d = 120;
+  camera.position.set(d, d, d); // строго диагональ (1,1,1) => true isometric 35.264°
+  camera.lookAt(0, 0, 0);
+}
+buildCamera();
+
+// Свет: направленный (имитация солнца под изо-углом) + мягкий ambient,
+// чтобы верх/бок кубов читались, но мы всё равно продублируем контраст
+// вручную через материалы граней (классический voxel-приём).
+const ambient = new THREE.AmbientLight(0xffffff, 0.7);
+scene.add(ambient);
+const sun = new THREE.DirectionalLight(0xffffff, 0.5);
+sun.position.set(80, 140, 60);
+scene.add(sun);
+
+// ---------------------------------------------------------------------------
+// ГРУППА ГОРОДА (та самая, что развёрнута на 45°)
+// ---------------------------------------------------------------------------
+const cityGroup = new THREE.Group();
+cityGroup.rotation.y = THREE.MathUtils.degToRad(CITY_ROTATION_DEG);
+scene.add(cityGroup);
+
+// Земля/грид — плейсхолдер рельефа (пока плоский, шаг сетки = будущий heightmap)
+const groundSize = CELL_SIZE * GRID_CELLS;
+const groundGeo = new THREE.PlaneGeometry(groundSize, groundSize);
+const groundMat = new THREE.MeshLambertMaterial({ color: 0x2f3b2f });
+const ground = new THREE.Mesh(groundGeo, groundMat);
+ground.rotation.x = -Math.PI / 2;
+cityGroup.add(ground);
+
+const grid = new THREE.GridHelper(groundSize, GRID_CELLS, 0x4a7a4a, 0x3a5a3a);
+grid.position.y = 0.05;
+cityGroup.add(grid);
+
+// ---------------------------------------------------------------------------
+// PIXEL-ART VOXEL BUILDING: 3-тональная закраска граней (верх/бок1/бок2)
+// вместо расчёта на реальном освещении — так буквы читаются чётче.
+// ---------------------------------------------------------------------------
+function shade(hex, factor) {
+  const c = new THREE.Color(hex);
+  return factor >= 1
+    ? c.lerp(new THREE.Color(0xffffff), factor - 1)
+    : c.lerp(new THREE.Color(0x000000), 1 - factor);
+}
+
+function makeBuilding({ x, z, w, d, floors, type }) {
+  const floorHeight = 3.2;
+  const height = floors * floorHeight;
+
+  const baseColor = type === 'residential' ? 0xd98a4a
+                   : type === 'industrial' ? 0x8a97a3
+                   : 0xb8b0a0;
+
+  const topColor   = shade(baseColor, 1.25);
+  const sideColorA = shade(baseColor, 0.85);
+  const sideColorB = shade(baseColor, 0.65);
+
+  // Порядок граней BoxGeometry: +x, -x, +y(top), -y(bottom), +z, -z
+  const materials = [
+    new THREE.MeshBasicMaterial({ color: sideColorA }), // +x
+    new THREE.MeshBasicMaterial({ color: sideColorB }), // -x
+    new THREE.MeshBasicMaterial({ color: topColor }),   // +y top
+    new THREE.MeshBasicMaterial({ color: 0x111111 }),   // -y bottom (не видно)
+    new THREE.MeshBasicMaterial({ color: sideColorA }), // +z
+    new THREE.MeshBasicMaterial({ color: sideColorB }), // -z
+  ];
+
+  const geo = new THREE.BoxGeometry(w, height, d);
+  const mesh = new THREE.Mesh(geo, materials);
+  mesh.position.set(x, height / 2, z);
+
+  // простые "окна" для жилых — тонкие тёмные полоски через EdgesGeometry
+  if (type === 'residential') {
+    const edges = new THREE.EdgesGeometry(geo);
+    const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0x2a1a10 }));
+    line.position.copy(mesh.position);
+    cityGroup.add(line);
+  }
+
+  cityGroup.add(mesh);
+  return mesh;
+}
+
+// Плейсхолдер-застройка на случай, если Overpass недоступен (демо/офлайн)
+function loadPlaceholderDemo() {
+  makeBuilding({ x: -30, z: -20, w: 18, d: 14, floors: 9,  type: 'residential' });
+  makeBuilding({ x: -30, z:  10, w: 18, d: 14, floors: 5,  type: 'residential' });
+  makeBuilding({ x:  -5, z: -30, w: 12, d: 10, floors: 2,  type: 'other' });
+  makeBuilding({ x:  15, z:   5, w: 30, d: 20, floors: 1,  type: 'industrial' });
+  makeBuilding({ x:  15, z: -25, w: 20, d: 12, floors: 1,  type: 'industrial' });
+  makeBuilding({ x:  35, z:  25, w: 10, d: 10, floors: 3,  type: 'residential' });
+}
+
+// ---------------------------------------------------------------------------
+// ГЕО-ПРОЕКЦИЯ: lat/lon -> локальные метры относительно центра bbox.
+// Простая equirectangular-аппроксимация — на масштабе квартала (сотни метров)
+// погрешность пренебрежимо мала, полноценный UTM не нужен.
+// Помним: +X = восток, -Z = север (см. настройки выше).
+// ---------------------------------------------------------------------------
+const EARTH_R = 6378137;
+function geoToLocal(lat, lon, refLat, refLon) {
+  const x = (lon - refLon) * Math.PI / 180 * EARTH_R * Math.cos(refLat * Math.PI / 180);
+  const z = -(lat - refLat) * Math.PI / 180 * EARTH_R;
+  return { x, z };
+}
+
+// ---------------------------------------------------------------------------
+// ТИП ЗДАНИЯ И ВЫСОТА ИЗ ТЕГОВ OSM
+// ---------------------------------------------------------------------------
+function classifyBuilding(tags) {
+  const b = tags.building || '';
+  if (['residential', 'apartments', 'house', 'terrace', 'dormitory'].includes(b)) return 'residential';
+  if (['industrial', 'warehouse', 'garage', 'garages', 'manufacture'].includes(b)) return 'industrial';
+  return 'other';
+}
+
+function estimateHeight(tags) {
+  if (tags.height) {
+    const h = parseFloat(String(tags.height).replace(/[^\d.]/g, ''));
+    if (!isNaN(h) && h > 0) return h;
+  }
+  if (tags['building:levels']) {
+    const levels = parseFloat(tags['building:levels']);
+    if (!isNaN(levels) && levels > 0) return levels * 3.2;
+  }
+  // дефолт по типу, если тегов нет вообще
+  const type = classifyBuilding(tags);
+  return type === 'industrial' ? 6 : 8; // ~1-2 этажа по умолчанию
+}
+
+// ---------------------------------------------------------------------------
+// ФАСАДНЫЕ ТЕКСТУРЫ: процедурные окна вместо плоской заливки.
+// Одна "ячейка" канваса = один оконный пролёт (bay) по горизонтали на один
+// этаж по вертикали. Повтор текстуры считаем из периметра здания и числа
+// этажей — так паттерн корректно растягивается на любую footprint-геометрию
+// из OSM, а не только на прямоугольные боксы.
+// ---------------------------------------------------------------------------
+const facadeTextureCache = {}; // канвас на тип здания создаём один раз
+
+function buildFacadeCanvas(type) {
+  const cell = type === 'industrial' ? 24 : 16;
+  const canvas = document.createElement('canvas');
+  canvas.width = cell;
+  canvas.height = cell;
+  const ctx = canvas.getContext('2d');
+
+  if (type === 'residential') {
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, cell, cell);
+    ctx.fillStyle = '#4a5568';                 // стекло
+    ctx.fillRect(3, 3, cell - 6, cell - 7);
+    ctx.strokeStyle = '#2a1a10';                // рама окна
+    ctx.lineWidth = 1;
+    ctx.strokeRect(3, 3, cell - 6, cell - 7);
+    ctx.fillStyle = 'rgba(0,0,0,0.18)';         // тень под окном/парапет балкона
+    ctx.fillRect(0, cell - 2, cell, 2);
+  } else if (type === 'industrial') {
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, cell, cell);
+    ctx.strokeStyle = 'rgba(0,0,0,0.15)';       // горизонтальный шов металлопрофиля
+    ctx.beginPath();
+    ctx.moveTo(0, cell * 0.5);
+    ctx.lineTo(cell, cell * 0.5);
+    ctx.stroke();
+    ctx.fillStyle = '#3a4550';                  // редкое узкое окно — минимум остекления
+    ctx.fillRect(cell * 0.38, cell * 0.12, cell * 0.24, cell * 0.22);
+  } else {
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(0, 0, cell, cell);
+    ctx.fillStyle = '#5a6a78';
+    ctx.fillRect(cell * 0.2, cell * 0.2, cell * 0.6, cell * 0.55);
+  }
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.magFilter = THREE.NearestFilter;          // без сглаживания — пиксель-арт
+  tex.minFilter = THREE.NearestFilter;
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  return tex;
+}
+
+function getFacadeTexture(type) {
+  if (!facadeTextureCache[type]) facadeTextureCache[type] = buildFacadeCanvas(type);
+  return facadeTextureCache[type];
+}
+
+const BAY_METERS = { residential: 4, industrial: 7, other: 5 }; // ширина одного оконного пролёта
+
+function polygonPerimeter(pts) {
+  let sum = 0;
+  for (let i = 0; i < pts.length; i++) {
+    const a = pts[i];
+    const b = pts[(i + 1) % pts.length];
+    sum += Math.hypot(b.x - a.x, b.z - a.z);
+  }
+  return sum;
+}
+
+// ---------------------------------------------------------------------------
+// ЭКСТРУЗИЯ ПОЛИГОНА ЗДАНИЯ (реальный footprint из OSM, а не бокс)
+// ---------------------------------------------------------------------------
+const loadedMeshes = []; // всё, что нужно чистить перед перезагрузкой
+
+function makeFootprintBuilding(points2D, height, type) {
+  // points2D: [{x,z}, ...] уже спроецированные локальные координаты,
+  // замкнутый контур (OSM way обычно даёт первую точку == последней — уберём дубль)
+  const pts = points2D.slice();
+  if (pts.length > 1) {
+    const a = pts[0], b = pts[pts.length - 1];
+    if (Math.abs(a.x - b.x) < 1e-6 && Math.abs(a.z - b.z) < 1e-6) pts.pop();
+  }
+  if (pts.length < 3) return null;
+
+  // THREE.Shape живёт в плоскости XY -> используем (x, z) здания как (x, y) шейпа,
+  // а после экструзии повернём геометрию в XZ-плоскость.
+  const shape = new THREE.Shape(pts.map(p => new THREE.Vector2(p.x, p.z)));
+
+  const geo = new THREE.ExtrudeGeometry(shape, {
+    depth: height,
+    bevelEnabled: false,
+    steps: 1,
+  });
+  // ExtrudeGeometry экструдирует вдоль +Z -> поворачиваем так, чтобы высота шла по Y
+  geo.rotateX(-Math.PI / 2);
+
+  const baseColor = type === 'residential' ? 0xd98a4a
+                   : type === 'industrial' ? 0x8a97a3
+                   : 0xb8b0a0;
+  const sideColor = shade(baseColor, 0.78);
+  const topColor  = shade(baseColor, 1.25);
+
+  // Повтор фасадной текстуры: по вертикали — ровно по числу этажей (UV высоты
+  // стены всегда 0..1, так что repeat.y=floors даёт одну ячейку на этаж);
+  // по горизонтали — берём средний размер сегмента полигона (периметр/число
+  // сегментов) и делим на ширину пролёта. Это приближение: у каждого сегмента
+  // своя длина, а материал общий на всё здание, поэтому длинные и короткие
+  // стены получат чуть разный масштаб окон — для пиксель-арт low-res стиля
+  // на глаз это не заметно, но при укрупнении текстур стоит пересмотреть.
+  const floors = Math.max(1, Math.round(height / 3.2));
+  const perimeter = polygonPerimeter(pts);
+  const avgSegment = perimeter / pts.length;
+  const bay = BAY_METERS[type] || 5;
+  const repeatX = Math.max(1, Math.round(avgSegment / bay));
+
+  const facadeTex = getFacadeTexture(type).clone();
+  facadeTex.needsUpdate = true;
+  facadeTex.repeat.set(repeatX, floors);
+
+  // ExtrudeGeometry создаёт 2 группы материалов: 0 = боковые грани, 1 = крышки (верх+низ)
+  // DoubleSide обязателен: полигоны OSM бывают закручены в любую сторону,
+  // без этого часть зданий будет "невидимой" из-за backface culling.
+  const materials = [
+    new THREE.MeshBasicMaterial({ map: facadeTex, color: sideColor, side: THREE.DoubleSide }),
+    new THREE.MeshBasicMaterial({ color: topColor, side: THREE.DoubleSide }),
+  ];
+
+  const mesh = new THREE.Mesh(geo, materials);
+  cityGroup.add(mesh);
+  loadedMeshes.push(mesh);
+
+  if (type === 'residential') {
+    const edges = new THREE.EdgesGeometry(geo, 20);
+    const line = new THREE.LineSegments(edges, new THREE.LineBasicMaterial({ color: 0x2a1a10 }));
+    cityGroup.add(line);
+    loadedMeshes.push(line);
+  }
+
+  return mesh;
+}
+
+function clearLoadedBuildings() {
+  loadedMeshes.forEach(m => {
+    cityGroup.remove(m);
+    m.geometry.dispose();
+    if (Array.isArray(m.material)) m.material.forEach(mm => mm.dispose());
+    else m.material.dispose();
+  });
+  loadedMeshes.length = 0;
+}
+
+// ---------------------------------------------------------------------------
+// OVERPASS: запрос зданий внутри bbox.
+// Порядок зеркал: сначала VK Maps (RU) — по опыту стабильнее из РФ, чем
+// немецкий overpass-api.de; дальше официальный основной сервер; дальше
+// private.coffee (бывший kumi.systems — домен сменился в 2026, старый
+// адрес больше не даёт нужных CORS-заголовков).
+// ---------------------------------------------------------------------------
+const OVERPASS_ENDPOINTS = [
+  'https://maps.mail.ru/osm/tools/overpass/api/interpreter',
+  'https://overpass-api.de/api/interpreter',
+  'https://overpass.private.coffee/api/interpreter',
+];
+const OVERPASS_TIMEOUT_MS = 12000; // не ждём зависшее зеркало вечно — переходим к следующему
+
+async function fetchBuildings(latMin, lonMin, latMax, lonMax, onAttempt) {
+  const query = `[out:json][timeout:25];(way["building"](${latMin},${lonMin},${latMax},${lonMax}););out geom;`;
+
+  let lastErr;
+  for (const endpoint of OVERPASS_ENDPOINTS) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), OVERPASS_TIMEOUT_MS);
+    onAttempt?.(endpoint);
+    try {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        body: 'data=' + encodeURIComponent(query),
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const json = await res.json();
+      return { elements: json.elements || [], endpoint };
+    } catch (e) {
+      clearTimeout(timer);
+      lastErr = e;
+      // пробуем следующее зеркало
+    }
+  }
+  throw lastErr;
+}
+
+// ---------------------------------------------------------------------------
+// ПЕРЕСТРОЙКА СЦЕНЫ ПОД РЕАЛЬНЫЙ BBOX
+// ---------------------------------------------------------------------------
+function reframeTo(widthMeters, depthMeters) {
+  const maxDim = Math.max(widthMeters, depthMeters);
+  FRUSTUM_SIZE_STATE.value = maxDim * 1.35;
+  ground.geometry.dispose();
+  ground.geometry = new THREE.PlaneGeometry(maxDim * 1.5, maxDim * 1.5);
+  cityGroup.remove(grid);
+  const cells = Math.max(4, Math.round(maxDim / CELL_SIZE));
+  const newGrid = new THREE.GridHelper(maxDim * 1.5, cells, 0x4a7a4a, 0x3a5a3a);
+  newGrid.position.y = 0.05;
+  cityGroup.add(newGrid);
+  applyResolution();
+}
+
+// ---------------------------------------------------------------------------
+// МИНИКАРТА (Leaflet): настоящий OSM-вид того же bbox — чтобы сверять
+// глазами, действительно ли то, что отрисовалось в 3D, соответствует
+// реальной застройке, а не артефакт парсинга/проекции.
+// ---------------------------------------------------------------------------
+let minimap, minimapBboxLayer, minimapBuildingsLayer;
+
+function initMinimap() {
+  minimap = L.map('minimap', {
+    zoomControl: false,
+    attributionControl: false,
+    dragging: true,
+    scrollWheelZoom: false, // не перехватывать колесо мыши у страницы/сцены
+  }).setView([53.252, 34.370], 15);
+
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    subdomains: ['a', 'b', 'c'],
+    maxZoom: 19,
+  }).addTo(minimap);
+
+  minimapBboxLayer = L.layerGroup().addTo(minimap);
+  minimapBuildingsLayer = L.layerGroup().addTo(minimap);
+}
+
+function updateMinimap(latMin, lonMin, latMax, lonMax, elements) {
+  if (!minimap) return;
+  minimapBboxLayer.clearLayers();
+  minimapBuildingsLayer.clearLayers();
+
+  const bounds = L.latLngBounds([latMin, lonMin], [latMax, lonMax]);
+  L.rectangle(bounds, { color: '#5cf', weight: 2, fill: false }).addTo(minimapBboxLayer);
+  minimap.fitBounds(bounds, { padding: [20, 20] });
+
+  (elements || []).forEach(el => {
+    if (el.type !== 'way' || !el.geometry) return;
+    const latlngs = el.geometry.map(g => [g.lat, g.lon]);
+    const type = classifyBuilding(el.tags || {});
+    const color = type === 'residential' ? '#d98a4a' : type === 'industrial' ? '#8a97a3' : '#b8b0a0';
+    L.polygon(latlngs, { color, weight: 1, fillColor: color, fillOpacity: 0.65 }).addTo(minimapBuildingsLayer);
+  });
+}
+
+async function loadFromOverpass() {
+  const latMin = parseFloat(document.getElementById('latMin').value);
+  const latMax = parseFloat(document.getElementById('latMax').value);
+  const lonMin = parseFloat(document.getElementById('lonMin').value);
+  const lonMax = parseFloat(document.getElementById('lonMax').value);
+  const statusEl = document.getElementById('status');
+
+  const refLat = (latMin + latMax) / 2;
+  const refLon = (lonMin + lonMax) / 2;
+
+  statusEl.textContent = 'запрос к Overpass...';
+  try {
+    const { elements, endpoint } = await fetchBuildings(
+      latMin, lonMin, latMax, lonMax,
+      (ep) => { statusEl.textContent = `пробуем ${new URL(ep).hostname}...`; }
+    );
+    clearLoadedBuildings();
+
+    let count = 0;
+    for (const el of elements) {
+      if (el.type !== 'way' || !el.geometry) continue;
+      const points2D = el.geometry.map(g => geoToLocal(g.lat, g.lon, refLat, refLon));
+      const type = classifyBuilding(el.tags || {});
+      const height = estimateHeight(el.tags || {});
+      const mesh = makeFootprintBuilding(points2D, height, type);
+      if (mesh) count++;
+    }
+
+    const corner1 = geoToLocal(latMin, lonMin, refLat, refLon);
+    const corner2 = geoToLocal(latMax, lonMax, refLat, refLon);
+    reframeTo(Math.abs(corner2.x - corner1.x), Math.abs(corner2.z - corner1.z));
+    updateMinimap(latMin, lonMin, latMax, lonMax, elements);
+
+    statusEl.textContent = count > 0
+      ? `готово: ${count} зданий (${new URL(endpoint).hostname})`
+      : `зданий не найдено (${new URL(endpoint).hostname})`;
+  } catch (e) {
+    statusEl.textContent = 'ошибка Overpass — демо-заглушка';
+    console.error(e);
+    clearLoadedBuildings();
+    loadPlaceholderDemo();
+  }
+}
+
+document.getElementById('loadBtn').addEventListener('click', loadFromOverpass);
+
+// стартовая загрузка демо-bbox при открытии страницы
+initMinimap();
+loadFromOverpass();
+
+// ---------------------------------------------------------------------------
+// КОМПАС: т.к. cityGroup развёрнут на CITY_ROTATION_DEG вокруг Y, а -Z в
+// мировых координатах = север, стрелка компаса на экране должна учитывать
+// этот поворот. Считаем экранный угол направления "север" один раз.
+// ---------------------------------------------------------------------------
+function updateCompass() {
+  // направление "север" в мировых координатах после поворота cityGroup
+  const northWorld = new THREE.Vector3(0, 0, -1)
+    .applyAxisAngle(new THREE.Vector3(0, 1, 0), cityGroup.rotation.y);
+
+  // проекция этого вектора на плоскость экрана при текущей изо-камере:
+  // экранный X ~ (east - north)-компонента, экранный Y ~ вертикаль минус (east+north)
+  // для true isometric (азимут камеры 45°, positions (1,1,1)) действует:
+  const sx = northWorld.x - northWorld.z;
+  const sy = northWorld.x + northWorld.z; // экранная "глубина", не используем для угла напрямую
+  const angleRad = Math.atan2(sx, -northWorld.y * 0 - 1) ; // упрощённо: см. ниже точный расчёт
+
+  // Точный расчёт: спроецируем точку (northWorld) камерой и сравним с центром экрана.
+  const p0 = new THREE.Vector3(0, 0, 0).project(camera);
+  const p1 = northWorld.clone().project(camera);
+  const dx = p1.x - p0.x;
+  const dy = -(p1.y - p0.y); // инверсия Y (canvas vs NDC)
+  const screenAngleDeg = Math.atan2(dx, dy) * 180 / Math.PI;
+
+  document.getElementById('compass-needle').setAttribute(
+    'transform', `rotate(${screenAngleDeg} 30 30)`
+  );
+}
+
+// ---------------------------------------------------------------------------
+// RENDER LOOP + управление внутренним разрешением (pixel-art чанкость)
+// ---------------------------------------------------------------------------
+function applyResolution() {
+  const w = Math.round(VIEW_W * INTERNAL_SCALE);
+  const h = Math.round(VIEW_H * INTERNAL_SCALE);
+  renderer.setSize(w, h, false);
+  renderer.domElement.style.width = VIEW_W + 'px';
+  renderer.domElement.style.height = VIEW_H + 'px';
+  camera.left   = -FRUSTUM_SIZE_STATE.value * (VIEW_W / VIEW_H) / 2;
+  camera.right  =  FRUSTUM_SIZE_STATE.value * (VIEW_W / VIEW_H) / 2;
+  camera.top    =  FRUSTUM_SIZE_STATE.value / 2;
+  camera.bottom = -FRUSTUM_SIZE_STATE.value / 2;
+  camera.updateProjectionMatrix();
+}
+applyResolution();
+updateCompass();
+
+document.querySelectorAll('#controls button').forEach(btn => {
+  btn.addEventListener('click', () => {
+    INTERNAL_SCALE = parseFloat(btn.dataset.scale);
+    applyResolution();
+  });
+});
+
+function animate() {
+  requestAnimationFrame(animate);
+  renderer.render(scene, camera);
+}
+animate();
+</script>
+</body>
+</html>
