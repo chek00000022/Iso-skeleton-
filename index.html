@@ -82,7 +82,7 @@
 
 <div id="hud">
   ISO SKELETON // real Overpass footprints, fixed isometric camera<br>
-  зелёная сетка — 1 клетка = <span id="hud-cell">10</span> м (авто-подгонка под bbox)
+  покрытие двора: газон + бетонные дорожки (тайл ~<span id="hud-cell">16</span> м)
 </div>
 
 <div id="controls">
@@ -138,7 +138,7 @@ import * as THREE from 'three';
 // Камера стоит строго по диагонали (1,1,1) — угол места 35.264° (true isometric).
 const CITY_ROTATION_DEG = 45;           // поворот сетки для ромбовидного вида
 const CELL_SIZE = 10;                    // метры на одну ячейку грида
-const GRID_CELLS = 20;                   // 20×20 ячеек = квартал ~200×200 м
+const GRID_CELLS = 20;                   // множитель начального размера площадки (20×10м=200м), сама сетка больше не рисуется
 
 let INTERNAL_SCALE = 0.5;                // множитель разрешения рендера (пиксель-арт чанкость)
 
@@ -189,17 +189,54 @@ const cityGroup = new THREE.Group();
 cityGroup.rotation.y = THREE.MathUtils.degToRad(CITY_ROTATION_DEG);
 scene.add(cityGroup);
 
-// Земля/грид — плейсхолдер рельефа (пока плоский, шаг сетки = будущий heightmap)
+// ---------------------------------------------------------------------------
+// ТЕКСТУРА ЗЕМЛИ: газон с пиксельным шумом + бетонные дорожки (двор-крест на
+// тайл). Заменяет прежний плоский зелёный цвет+GridHelper — теперь это
+// повторяющаяся canvas-текстура, тайлится через RepeatWrapping.
+// ---------------------------------------------------------------------------
+const GROUND_TILE_METERS = 16; // размер одного тайла текстуры в метрах
+
+function buildGroundTexture() {
+  const size = 32;
+  const canvas = document.createElement('canvas');
+  canvas.width = size;
+  canvas.height = size;
+  const ctx = canvas.getContext('2d');
+
+  // газон — пиксельный шум из нескольких оттенков зелёного
+  const grassShades = ['#33502f', '#3a5a35', '#2c4728', '#405f3a'];
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      ctx.fillStyle = grassShades[Math.floor(Math.random() * grassShades.length)];
+      ctx.fillRect(x, y, 1, 1);
+    }
+  }
+
+  // бетонное покрытие — дворовые дорожки крестом через тайл
+  ctx.fillStyle = '#8f8f88';
+  ctx.fillRect(0, size / 2 - 1, size, 3);
+  ctx.fillRect(size / 2 - 1, 0, 3, size);
+  ctx.fillStyle = 'rgba(0,0,0,0.15)'; // шов/тень плиты
+  ctx.fillRect(0, size / 2 + 1, size, 1);
+  ctx.fillRect(size / 2 + 1, 0, 1, size);
+
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.magFilter = THREE.NearestFilter;
+  tex.minFilter = THREE.NearestFilter;
+  tex.wrapS = tex.wrapT = THREE.RepeatWrapping;
+  return tex;
+}
+
+const groundTexture = buildGroundTexture();
+
+// Земля — пока плоская (рельеф добавим позже), но уже с текстурой вместо заливки
 const groundSize = CELL_SIZE * GRID_CELLS;
 const groundGeo = new THREE.PlaneGeometry(groundSize, groundSize);
-const groundMat = new THREE.MeshLambertMaterial({ color: 0x2f3b2f });
+const groundMat = new THREE.MeshBasicMaterial({ map: groundTexture });
 const ground = new THREE.Mesh(groundGeo, groundMat);
 ground.rotation.x = -Math.PI / 2;
+groundTexture.repeat.set(groundSize / GROUND_TILE_METERS, groundSize / GROUND_TILE_METERS);
 cityGroup.add(ground);
-
-const grid = new THREE.GridHelper(groundSize, GRID_CELLS, 0x4a7a4a, 0x3a5a3a);
-grid.position.y = 0.05;
-cityGroup.add(grid);
 
 // ---------------------------------------------------------------------------
 // PIXEL-ART VOXEL BUILDING: 3-тональная закраска граней (верх/бок1/бок2)
@@ -512,15 +549,33 @@ function makeRoad(points2D, tags) {
   loadedMeshes.push(mesh);
 
   if (cum[cum.length - 1] > 8 && !NON_DRIVABLE.has(tags.highway)) {
-    roadRegistry.push({ points: points2D, cum, total: cum[cum.length - 1] });
+    roadRegistry.push({ points: points2D, cum, total: cum[cum.length - 1], highway: tags.highway });
   }
   return mesh;
 }
 
 // ---------------------------------------------------------------------------
 // МАШИНЫ: voxel-блоки, едущие вдоль дорог по параметрической дистанции.
+// Плотность (машин на метр дороги) и скорость зависят от типа highway —
+// на магистралях больше и быстрее, во дворах/на service — редко и медленно.
 // ---------------------------------------------------------------------------
-const MAX_CARS = 14;
+const ROAD_CAR_PROFILE = {
+  motorway:      { perMeter: 1 / 22, min: 2, max: 6, speedMin: 14, speedMax: 20 },
+  trunk:         { perMeter: 1 / 22, min: 2, max: 6, speedMin: 13, speedMax: 18 },
+  primary:       { perMeter: 1 / 22, min: 1, max: 5, speedMin: 10, speedMax: 15 },
+  secondary:     { perMeter: 1 / 28, min: 1, max: 4, speedMin: 9,  speedMax: 13 },
+  tertiary:      { perMeter: 1 / 40, min: 0, max: 3, speedMin: 7,  speedMax: 10 },
+  unclassified:  { perMeter: 1 / 55, min: 0, max: 2, speedMin: 5,  speedMax: 7  },
+  residential:   { perMeter: 1 / 70, min: 0, max: 2, speedMin: 3,  speedMax: 5  },
+  living_street: { perMeter: 1 / 80, min: 0, max: 1, speedMin: 2,  speedMax: 4  },
+  service:       { perMeter: 1 / 150, min: 0, max: 1, speedMin: 2, speedMax: 3 }, // почти пусто — 0-1 машина
+};
+const DEFAULT_CAR_PROFILE = { perMeter: 1 / 60, min: 0, max: 2, speedMin: 4, speedMax: 6 };
+
+function carProfileFor(highway) {
+  return ROAD_CAR_PROFILE[highway] || DEFAULT_CAR_PROFILE;
+}
+
 let cars = [];
 
 function carBodyColor() {
@@ -552,19 +607,26 @@ function makeCarMesh() {
 function spawnCars() {
   cars.forEach(c => cityGroup.remove(c.mesh));
   cars = [];
-  if (roadRegistry.length === 0) return;
-  const count = Math.min(MAX_CARS, roadRegistry.length * 2);
-  for (let i = 0; i < count; i++) {
-    const road = roadRegistry[Math.floor(Math.random() * roadRegistry.length)];
-    const mesh = makeCarMesh();
-    cityGroup.add(mesh);
-    cars.push({
-      mesh, road,
-      dist: Math.random() * road.total,
-      speed: 3 + Math.random() * 3, // м/с, чисто для оживления сцены
-      dir: Math.random() < 0.5 ? 1 : -1,
-    });
-  }
+
+  roadRegistry.forEach(road => {
+    const profile = carProfileFor(road.highway);
+    let count = Math.round(road.total * profile.perMeter);
+    count = Math.min(profile.max, Math.max(profile.min, count));
+
+    // service — не на каждом дворовом проезде должна стоять машина
+    if (road.highway === 'service' && count > 0 && Math.random() > 0.35) count = 0;
+
+    for (let i = 0; i < count; i++) {
+      const mesh = makeCarMesh();
+      cityGroup.add(mesh);
+      cars.push({
+        mesh, road,
+        dist: Math.random() * road.total,
+        speed: profile.speedMin + Math.random() * (profile.speedMax - profile.speedMin),
+        dir: Math.random() < 0.5 ? 1 : -1,
+      });
+    }
+  });
 }
 
 function pointAtDistance(road, dist) {
@@ -641,13 +703,10 @@ async function fetchCityData(latMin, lonMin, latMax, lonMax, onAttempt) {
 function reframeTo(widthMeters, depthMeters) {
   const maxDim = Math.max(widthMeters, depthMeters);
   FRUSTUM_SIZE_STATE.value = maxDim * 1.35;
+  const newGroundSize = maxDim * 1.5;
   ground.geometry.dispose();
-  ground.geometry = new THREE.PlaneGeometry(maxDim * 1.5, maxDim * 1.5);
-  cityGroup.remove(grid);
-  const cells = Math.max(4, Math.round(maxDim / CELL_SIZE));
-  const newGrid = new THREE.GridHelper(maxDim * 1.5, cells, 0x4a7a4a, 0x3a5a3a);
-  newGrid.position.y = 0.05;
-  cityGroup.add(newGrid);
+  ground.geometry = new THREE.PlaneGeometry(newGroundSize, newGroundSize);
+  groundTexture.repeat.set(newGroundSize / GROUND_TILE_METERS, newGroundSize / GROUND_TILE_METERS);
   applyResolution();
 }
 
