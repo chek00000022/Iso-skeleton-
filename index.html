@@ -381,7 +381,12 @@ function makeFootprintBuilding(points2D, height, type) {
 
   // THREE.Shape живёт в плоскости XY -> используем (x, z) здания как (x, y) шейпа,
   // а после экструзии повернём геометрию в XZ-плоскость.
-  const shape = new THREE.Shape(pts.map(p => new THREE.Vector2(p.x, p.z)));
+  // ВАЖНО: ось Z инвертируем (-p.z). geo.rotateX(-90°) ниже сам по себе
+  // переворачивает знак этой оси (Y_shape -> -Z_world), поэтому чтобы итоговая
+  // ориентация здания совпадала с дорогами/сеткой (у которых -Z = север без
+  // всякого поворота), контур нужно один раз зеркально скомпенсировать здесь.
+  // Без этой инверсии здания получаются отражены по оси север-юг.
+  const shape = new THREE.Shape(pts.map(p => new THREE.Vector2(p.x, -p.z)));
 
   const geo = new THREE.ExtrudeGeometry(shape, {
     depth: height,
@@ -525,16 +530,21 @@ function carBodyColor() {
 
 function makeCarMesh() {
   const group = new THREE.Group();
+  // Длинная сторона кузова/кабины — вдоль локальной оси Z. Это важно:
+  // pointAtDistance() отдаёт heading = atan2(dx, dz), а при rotation.y=0
+  // three.js направляет локальную +Z вперёд в мировых координатах — значит
+  // "перёд" машины должен смотреть вдоль Z, иначе при повороте на heading
+  // машина едет боком (что и было при length вдоль X).
   const body = new THREE.Mesh(
-    new THREE.BoxGeometry(4.2, 1.4, 1.9),
+    new THREE.BoxGeometry(1.9, 1.4, 4.2),
     new THREE.MeshBasicMaterial({ color: carBodyColor() })
   );
   body.position.y = 0.9;
   const cabin = new THREE.Mesh(
-    new THREE.BoxGeometry(2.2, 1.0, 1.7),
+    new THREE.BoxGeometry(1.7, 1.0, 2.2),
     new THREE.MeshBasicMaterial({ color: 0x9fd0e8 })
   );
-  cabin.position.set(-0.2, 1.7, 0);
+  cabin.position.set(0, 1.7, -0.2);
   group.add(body, cabin);
   return group;
 }
