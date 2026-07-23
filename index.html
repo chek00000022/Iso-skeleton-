@@ -630,6 +630,73 @@ function makeBarrier(points2D, tags) {
   return mesh;
 }
 
+// ---------------------------------------------------------------------------
+// Ж/Д ПУТИ: лента балласта (как у дорог) + два тонких рельса поверх, смещённые
+// от центра линии на "колею". Длинные перегоны (>100 м) регистрируются для
+// составов — короткие подъездные тупики поездов не получают.
+// ---------------------------------------------------------------------------
+const RAIL_BALLAST_COLOR = 0x5a5248;
+const RAIL_RAIL_COLOR = 0xc4c4b8;
+const RAIL_WIDTH = 3.4;
+const RAIL_GAUGE = 0.9; // смещение каждого рельса от центра линии, м
+
+const railRegistry = []; // {points, cum, total} — длинные перегоны для составов
+
+function railNormalAt(points2D, i) {
+  const p = points2D[i];
+  const prev = points2D[Math.max(0, i - 1)];
+  const next = points2D[Math.min(points2D.length - 1, i + 1)];
+  const dx = next.x - prev.x, dz = next.z - prev.z;
+  const len = Math.hypot(dx, dz) || 1;
+  return { nx: -dz / len, nz: dx / len, base: p };
+}
+
+function makeRailway(points2D) {
+  if (points2D.length < 2) return null;
+
+  // балласт — та же triangle-strip логика, что и у дорог
+  const positions = [];
+  const indices = [];
+  const cum = [0];
+  for (let i = 1; i < points2D.length; i++) {
+    cum.push(cum[i - 1] + Math.hypot(points2D[i].x - points2D[i - 1].x, points2D[i].z - points2D[i - 1].z));
+  }
+  for (let i = 0; i < points2D.length; i++) {
+    const { nx, nz, base } = railNormalAt(points2D, i);
+    positions.push(base.x + nx * RAIL_WIDTH / 2, 0.10, base.z + nz * RAIL_WIDTH / 2);
+    positions.push(base.x - nx * RAIL_WIDTH / 2, 0.10, base.z - nz * RAIL_WIDTH / 2);
+  }
+  for (let i = 0; i < points2D.length - 1; i++) {
+    const a = i * 2, b = i * 2 + 1, c = i * 2 + 2, d = i * 2 + 3;
+    indices.push(a, b, c, b, d, c);
+  }
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+  geo.setIndex(indices);
+  const ballast = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: RAIL_BALLAST_COLOR, side: THREE.DoubleSide }));
+  cityGroup.add(ballast);
+  loadedMeshes.push(ballast);
+
+  // два тонких рельса поверх балласта
+  [-1, 1].forEach(side => {
+    const railPositions = [];
+    for (let i = 0; i < points2D.length; i++) {
+      const { nx, nz, base } = railNormalAt(points2D, i);
+      railPositions.push(base.x + nx * RAIL_GAUGE * side, 0.11, base.z + nz * RAIL_GAUGE * side);
+    }
+    const railGeo = new THREE.BufferGeometry();
+    railGeo.setAttribute('position', new THREE.Float32BufferAttribute(railPositions, 3));
+    const railLine = new THREE.Line(railGeo, new THREE.LineBasicMaterial({ color: RAIL_RAIL_COLOR }));
+    cityGroup.add(railLine);
+    loadedMeshes.push(railLine);
+  });
+
+  if (cum[cum.length - 1] > 8) {
+    railRegistry.push({ points: points2D, cum, total: cum[cum.length - 1] });
+  }
+  return ballast;
+}
+
 function clearLoadedBuildings() {
   loadedMeshes.forEach(m => {
     cityGroup.remove(m);
@@ -640,6 +707,7 @@ function clearLoadedBuildings() {
   loadedMeshes.length = 0;
   roadRegistry.length = 0;
   waterBodyRegistry.length = 0;
+  railRegistry.length = 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -925,6 +993,112 @@ function updateBoats(dt) {
 }
 
 // ---------------------------------------------------------------------------
+// ПОЕЗДА: локомотив + цепочка вагонов, идущих "змейкой" позади головы состава
+// по той же полилинии (та же математика pointAtDistance, что и у машин, но
+// каждый вагон запрашивает точку на смещённой дистанции = headDist - offset).
+// Два вида: грузовой (зелёный тягач + цистерны) и пассажирский (белый
+// локомотив + вагоны с окнами).
+// ---------------------------------------------------------------------------
+function makeLocomotiveMesh(bodyColor) {
+  const group = new THREE.Group();
+  const body = new THREE.Mesh(
+    new THREE.BoxGeometry(2.9, 3.2, 11),
+    new THREE.MeshBasicMaterial({ color: bodyColor })
+  );
+  body.position.y = 1.8;
+  const cabWindow = new THREE.Mesh(
+    new THREE.BoxGeometry(2.92, 0.8, 2.2),
+    new THREE.MeshBasicMaterial({ color: 0x3a4550 })
+  );
+  cabWindow.position.set(0, 2.9, -4);
+  group.add(body, cabWindow);
+  return group;
+}
+
+function makeTankWagonMesh() {
+  const group = new THREE.Group();
+  const tank = new THREE.Mesh(
+    new THREE.CylinderGeometry(1.5, 1.5, 10, 12),
+    new THREE.MeshBasicMaterial({ color: 0x8a8a82 })
+  );
+  tank.rotation.x = Math.PI / 2; // ось цилиндра (по умолчанию Y) -> вдоль Z, "перёд"
+  tank.position.y = 1.9;
+  group.add(tank);
+  return group;
+}
+
+function makePassengerWagonMesh() {
+  const group = new THREE.Group();
+  const body = new THREE.Mesh(
+    new THREE.BoxGeometry(2.6, 2.2, 10),
+    new THREE.MeshBasicMaterial({ color: 0xe8e4d8 })
+  );
+  body.position.y = 1.6;
+  const windowStrip = new THREE.Mesh(
+    new THREE.BoxGeometry(2.62, 0.6, 9.6),
+    new THREE.MeshBasicMaterial({ color: 0x6a8aa0 })
+  );
+  windowStrip.position.y = 2.0;
+  const stripe = new THREE.Mesh(
+    new THREE.BoxGeometry(2.63, 0.25, 10),
+    new THREE.MeshBasicMaterial({ color: 0x2a5fd9 })
+  );
+  stripe.position.y = 1.0;
+  group.add(body, windowStrip, stripe);
+  return group;
+}
+
+const TRAIN_KINDS = {
+  freight:    { locoColor: 0x2f7d3a, wagonBuilder: makeTankWagonMesh, wagonCount: 5 },
+  passenger:  { locoColor: 0xf2f2ec, wagonBuilder: makePassengerWagonMesh, wagonCount: 4 },
+};
+const TRAIN_CAR_SPACING = 11; // расстояние между центрами соседних вагонов, м
+const TRAIN_MIN_RAIL_LENGTH = 100; // короткие подъездные пути — без составов
+
+let trains = [];
+
+function spawnTrains() {
+  trains.forEach(t => t.cars.forEach(c => cityGroup.remove(c.mesh)));
+  trains = [];
+
+  railRegistry.forEach(rail => {
+    if (rail.total < TRAIN_MIN_RAIL_LENGTH) return;
+    const kind = TRAIN_KINDS[Math.random() < 0.5 ? 'freight' : 'passenger'];
+    const dir = Math.random() < 0.5 ? 1 : -1;
+
+    const cars = [];
+    const locoMesh = makeLocomotiveMesh(kind.locoColor);
+    cityGroup.add(locoMesh);
+    cars.push({ mesh: locoMesh, offset: 0 });
+
+    for (let i = 1; i <= kind.wagonCount; i++) {
+      const wagonMesh = kind.wagonBuilder();
+      cityGroup.add(wagonMesh);
+      cars.push({ mesh: wagonMesh, offset: i * TRAIN_CAR_SPACING });
+    }
+
+    trains.push({
+      cars, rail, dir,
+      headDist: Math.random() * rail.total,
+      speed: 8 + Math.random() * 4, // м/с — медленнее машин на магистралях, как и должно быть у состава
+    });
+  });
+}
+
+function updateTrains(dt) {
+  trains.forEach(t => {
+    t.headDist += t.speed * t.dir * dt;
+    t.cars.forEach(c => {
+      // вагоны отстают от головы состава на offset метров вдоль пути движения
+      const d = t.headDist - c.offset * t.dir;
+      const p = pointAtDistance(t.rail, d);
+      c.mesh.position.set(p.x, 0.14, p.z);
+      c.mesh.rotation.y = t.dir > 0 ? p.heading : p.heading + Math.PI;
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // OVERPASS: запрос зданий внутри bbox.
 // Порядок зеркал: сначала VK Maps (RU) — по опыту стабильнее из РФ, чем
 // немецкий overpass-api.de; дальше официальный основной сервер; дальше
@@ -947,6 +1121,7 @@ async function fetchCityData(latMin, lonMin, latMax, lonMax, onAttempt) {
     relation["natural"="water"](${latMin},${lonMin},${latMax},${lonMax});
     way["landuse"="reservoir"](${latMin},${lonMin},${latMax},${lonMax});
     way["barrier"](${latMin},${lonMin},${latMax},${lonMax});
+    way["railway"="rail"](${latMin},${lonMin},${latMax},${lonMax});
   );out geom;`;
 
   let lastErr;
@@ -1046,6 +1221,8 @@ function updateMinimapOverlay(elements) {
         L.polygon(latlngs, { color, weight: 1, fillColor: color, fillOpacity: 0.65 }).addTo(minimapBuildingsLayer);
       } else if (el.tags?.highway) {
         L.polyline(latlngs, { color: '#5cf', weight: 2, opacity: 0.8 }).addTo(minimapRoadsLayer);
+      } else if (el.tags?.railway === 'rail') {
+        L.polyline(latlngs, { color: '#5a5248', weight: 2, opacity: 0.9, dashArray: '6,3' }).addTo(minimapRoadsLayer);
       } else if (el.tags?.natural === 'water' || el.tags?.landuse === 'reservoir') {
         L.polygon(latlngs, { color: '#1f4f70', weight: 1, fillColor: '#2f6ea8', fillOpacity: 0.7 }).addTo(minimapBuildingsLayer);
       } else if (el.tags?.barrier) {
@@ -1107,7 +1284,7 @@ async function loadFromOverpass() {
     );
     clearLoadedBuildings();
 
-    let buildingCount = 0, roadCount = 0, waterCount = 0, barrierCount = 0;
+    let buildingCount = 0, roadCount = 0, waterCount = 0, barrierCount = 0, railCount = 0;
     for (const el of elements) {
       if (el.type === 'way' && el.geometry) {
         const points2D = el.geometry.map(g => geoToLocal(g.lat, g.lon, refLat, refLon));
@@ -1117,6 +1294,8 @@ async function loadFromOverpass() {
           if (makeFootprintBuilding(points2D, height, type)) buildingCount++;
         } else if (el.tags?.highway) {
           if (makeRoad(points2D, el.tags)) roadCount++;
+        } else if (el.tags?.railway === 'rail') {
+          if (makeRailway(points2D)) railCount++;
         } else if (el.tags?.natural === 'water' || el.tags?.landuse === 'reservoir') {
           if (makeWaterBody(points2D)) waterCount++;
         } else if (el.tags?.barrier) {
@@ -1168,13 +1347,14 @@ async function loadFromOverpass() {
     }
     spawnCars();
     spawnBoats();
+    spawnTrains();
 
     const corner1 = geoToLocal(latMin, lonMin, refLat, refLon);
     const corner2 = geoToLocal(latMax, lonMax, refLat, refLon);
     reframeTo(Math.abs(corner2.x - corner1.x), Math.abs(corner2.z - corner1.z));
     updateMinimapOverlay(elements);
 
-    statusEl.textContent = `готово: ${buildingCount} зданий, ${roadCount} дорог, ${waterCount} водоёмов, ${barrierCount} заборов, ${cars.length} машин, ${boats.length} лодок (${new URL(endpoint).hostname})`;
+    statusEl.textContent = `готово: ${buildingCount} зданий, ${roadCount} дорог, ${railCount} ж/д путей, ${waterCount} водоёмов, ${barrierCount} заборов, ${cars.length} машин, ${boats.length} лодок, ${trains.length} составов (${new URL(endpoint).hostname})`;
   } catch (e) {
     statusEl.textContent = 'ошибка Overpass — демо-заглушка';
     console.error(e);
@@ -1253,6 +1433,7 @@ function animate() {
   const dt = Math.min(clock.getDelta(), 0.1); // clamp, чтобы вкладка после сворачивания не дёрнула машины телепортом
   updateCars(dt);
   updateBoats(dt);
+  updateTrains(dt);
   renderer.render(scene, camera);
 }
 animate();
